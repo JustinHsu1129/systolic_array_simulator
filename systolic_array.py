@@ -412,6 +412,26 @@ with col_ctrl:
         if st.session_state.current_step < len(st.session_state.sim_steps) - 1:
             st.session_state.current_step += 1
 
+    if st.button("⚡ Finish Now", use_container_width=True):
+        if not st.session_state.sim_steps:
+            steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N)
+            st.session_state.sim_steps  = steps
+            st.session_state.C_result   = C
+            st.session_state.log        = []
+        # Jump to last step and build full log instantly
+        last = len(st.session_state.sim_steps) - 1
+        st.session_state.current_step = last
+        st.session_state.running      = False
+        # Populate the full log in one shot
+        full_log = []
+        for s in st.session_state.sim_steps:
+            for f in s["fired"]:
+                full_log.append(
+                    f"t={s['t']} | PE({f['i']},{f['j']}): "
+                    f"{fmt_val(f['av'])}×{fmt_val(f['bv'])}={fmt_val(f['mult'])} → Σ={fmt_val(f['acc'])}"
+                )
+        st.session_state.log = full_log
+
     if st.button("↺ Reset", use_container_width=True):
         for k in ["sim_steps","log","terminal_history"]:
             st.session_state[k] = []
