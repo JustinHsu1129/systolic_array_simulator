@@ -34,6 +34,8 @@ def init_state():
     defaults = {
         "mode": "weight_stationary",
         "N": 3,
+        "active_rows": 3,
+        "active_cols": 3,
         "sim_steps": [],
         "current_step": -1,
         "C_result": None,
@@ -75,7 +77,20 @@ def fmt_val(v):
     return str(int(f)) if f == int(f) else f"{f:.2g}"
 
 # ── Simulation engine ────────────────────────────────────────────────────────
-def build_sim_steps(A, B, pe_overrides, mode, N):
+def build_sim_steps(A, B, pe_overrides, mode, N, active_rows=None, active_cols=None):
+    # Pad A rows beyond active_rows with zeros; pad B cols beyond active_cols with zeros
+    if active_rows is None: active_rows = N
+    if active_cols is None: active_cols = N
+
+    A_padded = A.copy()
+    B_padded = B.copy()
+    for i in range(N):
+        if i >= active_rows:
+            A_padded[i, :] = 0.0   # entire row zeroed → no west inputs on this lane
+    for j in range(N):
+        if j >= active_cols:
+            B_padded[:, j] = 0.0   # entire col zeroed → no north inputs on this lane
+
     acc   = np.zeros((N, N))
     steps = []
     for t in range(3 * N - 1):
@@ -85,10 +100,16 @@ def build_sim_steps(A, B, pe_overrides, mode, N):
         for i in range(N):
             for j in range(N):
                 k  = t - i - j
-                av = float(A[i][k]) if 0 <= k < N else None
-                bv = float(B[k][j]) if 0 <= k < N else None
-                a_regs[i][j] = av
-                b_regs[i][j] = bv
+                # Show None (no arrow/dot) for padded-out lanes so the viz stays clean
+                av = float(A_padded[i][k]) if (0 <= k < N and i < active_rows) else (
+                     0.0                   if (0 <= k < N and i >= active_rows) else None)
+                bv = float(B_padded[k][j]) if (0 <= k < N and j < active_cols) else (
+                     0.0                   if (0 <= k < N and j >= active_cols) else None)
+                # Keep None for display but treat 0-padded as 0 for multiply
+                av_vis = av  # used for display
+                bv_vis = bv
+                a_regs[i][j] = av_vis
+                b_regs[i][j] = bv_vis
                 if av is not None and bv is not None:
                     ov = pe_overrides[i][j]
                     if mode == "weight_stationary":
@@ -100,22 +121,30 @@ def build_sim_steps(A, B, pe_overrides, mode, N):
                     else:  # row_stationary
                         mult = (ov if ov is not None else av) * bv
                     acc[i][j] += mult
-                    fired.append({"i": i, "j": j, "av": av, "bv": bv,
-                                  "mult": mult, "acc": acc[i][j]})
+                    if mult != 0 or (i < active_rows and j < active_cols):
+                        fired.append({"i": i, "j": j, "av": av, "bv": bv,
+                                      "mult": mult, "acc": acc[i][j],
+                                      "padded": (i >= active_rows or j >= active_cols)})
         steps.append({
             "t": t,
             "a_regs": [row[:] for row in a_regs],
             "b_regs": [row[:] for row in b_regs],
             "acc": acc.copy(),
             "fired": fired,
+            "active_rows": active_rows,
+            "active_cols": active_cols,
         })
     return steps, acc.copy()
 
 # ── Drawing ──────────────────────────────────────────────────────────────────
-def draw_array(state, N, pe_overrides, mode_name):
+def draw_array(state, N, pe_overrides, mode_name, active_rows=None, active_cols=None):
+    if active_rows is None: active_rows = N
+    if active_cols is None: active_cols = N
+
     DARK = "#0e1117"; CELL = "#1a202c"; BORD = "#2d3748"; DIM = "#4a5568"
     A_COL = "#4299e1"; B_COL = "#ed8936"; ACC_COL = "#48bb78"
     STAT_COL = "#fc8181"; ACT_CELL = "#1c3a2a"; TXT = "#e2e8f0"
+    PAD_CELL = "#141414"; PAD_BORD = "#1e2430"   # muted style for zero-padded PEs
 
     if   N <= 4:  cell, gap, pad = 1.00, 0.22, 1.20; fs_pe,fs_v,fs_a = 6.5,7.0,8.0
     elif N <= 6:  cell, gap, pad = 0.80, 0.18, 1.10; fs_pe,fs_v,fs_a = 5.5,6.0,7.0
@@ -143,68 +172,106 @@ def draw_array(state, N, pe_overrides, mode_name):
             av  = state["a_regs"][i][j] if state else None
             bv  = state["b_regs"][i][j] if state else None
             acc = state["acc"][i][j]    if state else 0.0
-            active = state and any(f["i"]==i and f["j"]==j for f in state["fired"])
+            active = state and any(f["i"]==i and f["j"]==j and not f.get("padded") for f in state["fired"])
+
+            is_padded_row = (i >= active_rows)
+            is_padded_col = (j >= active_cols)
+            is_padded     = is_padded_row or is_padded_col
+
+            fc = ACT_CELL if (active and not is_padded) else (PAD_CELL if is_padded else CELL)
+            ec = ACC_COL  if (active and not is_padded) else (PAD_BORD if is_padded else BORD)
+            lw = 1.2      if (active and not is_padded) else 0.5
 
             rect = mpatches.FancyBboxPatch(
                 (cx - cell/2, cy - cell/2), cell, cell,
-                boxstyle="round,pad=0.03", linewidth=1.2 if active else 0.5,
-                edgecolor=ACC_COL if active else BORD,
-                facecolor=ACT_CELL if active else CELL, zorder=2)
+                boxstyle="round,pad=0.03", linewidth=lw,
+                edgecolor=ec, facecolor=fc, zorder=2,
+                alpha=0.45 if is_padded else 1.0)
             ax.add_patch(rect)
 
-            if N <= 10:
+            # Hatching for padded cells to make it crystal clear
+            if is_padded:
+                hatch = mpatches.FancyBboxPatch(
+                    (cx - cell/2, cy - cell/2), cell, cell,
+                    boxstyle="round,pad=0.03", linewidth=0,
+                    edgecolor="#2d3748", facecolor="none",
+                    hatch="////", zorder=2, alpha=0.25)
+                ax.add_patch(hatch)
+
+            # "0" label for padded cells
+            if is_padded and N <= 10:
+                ax.text(cx, cy, "0",
+                        ha="center", va="center", fontsize=fs_a,
+                        color="#2d3748", fontfamily="monospace", zorder=3, style="italic")
+
+            if N <= 10 and not is_padded:
                 ax.text(cx, cy + cell/2 - 0.09, f"PE{i},{j}",
                         ha="center", va="top", fontsize=fs_pe,
                         color=DIM, fontfamily="monospace", zorder=3)
+            elif N <= 10 and is_padded:
+                ax.text(cx, cy + cell/2 - 0.09, f"PE{i},{j}",
+                        ha="center", va="top", fontsize=fs_pe,
+                        color="#252a36", fontfamily="monospace", zorder=3)
 
-            if N <= 7:
-                if av is not None:
+            if N <= 7 and not is_padded:
+                if av is not None and av != 0.0:
                     ax.text(cx - cell/2 + 0.05, cy + cell*0.15,
                             f"a:{fmt_val(av)}", ha="left", va="center",
                             fontsize=fs_v, color=A_COL, fontfamily="monospace", zorder=3)
-                if bv is not None:
+                if bv is not None and bv != 0.0:
                     ax.text(cx + cell/2 - 0.05, cy + cell*0.15,
                             f"b:{fmt_val(bv)}", ha="right", va="center",
                             fontsize=fs_v, color=B_COL, fontfamily="monospace", zorder=3)
 
             dot_ms = max(1.5, 5 - N // 3)
-            if av is not None:
+            if av is not None and not is_padded_row:
                 ax.plot(cx - cell/2, cy, "o", ms=dot_ms, color=A_COL, alpha=0.85, zorder=4)
-            if bv is not None:
+            if bv is not None and not is_padded_col:
                 ax.plot(cx, cy + cell/2, "o", ms=dot_ms, color=B_COL, alpha=0.85, zorder=4)
 
-            lbl = ("Σ" if N <= 10 else "") + fmt_val(acc)
-            ax.text(cx, cy - cell/2 + 0.10, lbl,
-                    ha="center", va="bottom", fontsize=fs_a, fontweight="bold",
-                    color=ACC_COL if active else DIM,
-                    fontfamily="monospace", zorder=3)
+            if not is_padded:
+                lbl = ("Σ" if N <= 10 else "") + fmt_val(acc)
+                ax.text(cx, cy - cell/2 + 0.10, lbl,
+                        ha="center", va="bottom", fontsize=fs_a, fontweight="bold",
+                        color=ACC_COL if active else DIM,
+                        fontfamily="monospace", zorder=3)
 
             ov = pe_overrides[i][j]
-            if ov is not None and N <= 8:
+            if ov is not None and N <= 8 and not is_padded:
                 ax.text(cx + cell/2 - 0.04, cy + cell/2 - 0.07, "★",
                         ha="right", va="top", fontsize=fs_pe,
                         color=STAT_COL, fontfamily="monospace", zorder=3)
 
     for i in range(N):
-        cy = pad + (N - 1 - i) * step
+        cy       = pad + (N - 1 - i) * step
+        is_pad_r = (i >= active_rows)
+        row_col  = "#2d3748" if is_pad_r else A_COL
         ax.annotate("", xy=(pad - cell/2 - 0.04, cy),
                     xytext=(pad - cell/2 - 0.32, cy),
-                    arrowprops=dict(arrowstyle="->", color=A_COL, lw=0.8))
+                    arrowprops=dict(arrowstyle="->", color=row_col, lw=0.8,
+                                   alpha=0.35 if is_pad_r else 1.0))
         if N <= 13:
-            ax.text(pad - cell/2 - 0.35, cy, f"A[{i}]",
+            lbl = f"A[{i}]" + (" [0]" if is_pad_r else "")
+            ax.text(pad - cell/2 - 0.35, cy, lbl,
                     ha="right", va="center", fontsize=max(4.5, fs_pe),
-                    color=A_COL, fontfamily="monospace")
+                    color=row_col, fontfamily="monospace",
+                    alpha=0.45 if is_pad_r else 1.0)
 
     for j in range(N):
-        cx     = pad + j * step
-        top_cy = pad + (N - 1) * step
+        cx        = pad + j * step
+        top_cy    = pad + (N - 1) * step
+        is_pad_c  = (j >= active_cols)
+        col_color = "#2d3748" if is_pad_c else B_COL
         ax.annotate("", xy=(cx, top_cy + cell/2 + 0.04),
                     xytext=(cx, top_cy + cell/2 + 0.30),
-                    arrowprops=dict(arrowstyle="->", color=B_COL, lw=0.8))
+                    arrowprops=dict(arrowstyle="->", color=col_color, lw=0.8,
+                                   alpha=0.35 if is_pad_c else 1.0))
         if N <= 13:
-            ax.text(cx, top_cy + cell/2 + 0.34, f"B[{j}]",
+            lbl = f"B[{j}]" + (" [0]" if is_pad_c else "")
+            ax.text(cx, top_cy + cell/2 + 0.34, lbl,
                     ha="center", va="bottom", fontsize=max(4.5, fs_pe),
-                    color=B_COL, fontfamily="monospace")
+                    color=col_color, fontfamily="monospace",
+                    alpha=0.45 if is_pad_c else 1.0)
 
     ax.text(total_w + 0.1, 0, mode_name.replace("_", " "),
             ha="right", va="bottom", fontsize=6, color=DIM,
@@ -285,6 +352,8 @@ with st.sidebar:
     )
     if N != st.session_state.N:
         st.session_state.N = N
+        st.session_state.active_rows = N
+        st.session_state.active_cols = N
         for k in ["sim_steps","log","terminal_history"]:
             st.session_state[k] = []
         for k in ["current_step"]:
@@ -295,6 +364,15 @@ with st.sidebar:
         st.session_state.running = False
         if "_rand_A" in st.session_state: del st.session_state["_rand_A"]
         if "_rand_B" in st.session_state: del st.session_state["_rand_B"]
+
+    st.markdown("**Active inputs (others zero-padded)**")
+    c1, c2 = st.columns(2)
+    active_rows = c1.slider("A rows →", 1, N, min(st.session_state.active_rows, N), key="ar_slider")
+    active_cols = c2.slider("B cols ↓", 1, N, min(st.session_state.active_cols, N), key="ac_slider")
+    st.session_state.active_rows = active_rows
+    st.session_state.active_cols = active_cols
+    if active_rows < N or active_cols < N:
+        st.caption(f"🔲 {active_rows} active row(s) west · {active_cols} active col(s) north · rest → 0")
 
     st.markdown("---")
 
@@ -393,7 +471,7 @@ with col_ctrl:
     st.markdown("### Controls")
 
     if st.button("▶ Simulate", use_container_width=True, type="primary"):
-        steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N)
+        steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N, active_rows, active_cols)
         st.session_state.sim_steps      = steps
         st.session_state.current_step   = -1
         st.session_state.C_result       = C
@@ -405,7 +483,7 @@ with col_ctrl:
 
     if st.button("→ Step", use_container_width=True):
         if not st.session_state.sim_steps:
-            steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N)
+            steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N, active_rows, active_cols)
             st.session_state.sim_steps  = steps
             st.session_state.C_result   = C
             st.session_state.log        = []
@@ -414,7 +492,7 @@ with col_ctrl:
 
     if st.button("⚡ Finish Now", use_container_width=True):
         if not st.session_state.sim_steps:
-            steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N)
+            steps, C = build_sim_steps(A, B, pe_overrides, mode_key, N, active_rows, active_cols)
             st.session_state.sim_steps  = steps
             st.session_state.C_result   = C
             st.session_state.log        = []
@@ -480,12 +558,18 @@ with col_vis:
         idx   = min(st.session_state.current_step, len(st.session_state.sim_steps) - 1)
         state = st.session_state.sim_steps[idx]
         for f in state["fired"]:
+            if f.get("padded"):
+                continue   # skip zero-padded firings from the log
             entry = (f"t={state['t']} | PE({f['i']},{f['j']}): "
                      f"{fmt_val(f['av'])}×{fmt_val(f['bv'])}={fmt_val(f['mult'])} → Σ={fmt_val(f['acc'])}")
             if entry not in st.session_state.log:
                 st.session_state.log.append(entry)
 
-    fig = draw_array(state, N, pe_overrides, mode_key)
+    # Use active_rows/active_cols from current state snapshot if available, else sidebar values
+    vis_ar = state["active_rows"] if state and "active_rows" in state else active_rows
+    vis_ac = state["active_cols"] if state and "active_cols" in state else active_cols
+
+    fig = draw_array(state, N, pe_overrides, mode_key, vis_ar, vis_ac)
     st.pyplot(fig, use_container_width=True)
     plt.close(fig)
 
